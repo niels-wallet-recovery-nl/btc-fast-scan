@@ -1,7 +1,7 @@
 
 
 # btc-addr-accum-scan (BBF Edition)
-A fast Bitcoin/Ethereum address scanner using **BBF Polynomial RSA Accumulators** with **58² positional routing**. Compresses millions of addresses into ~100 MB while enabling individual address lookups with constant-time proofs (~16 ms per check). No blockchain download, no API rate limits.
+A fast Bitcoin/Ethereum address scanner using **BBF Polynomial RSA Accumulators** with **58² positional routing**. Compresses millions of addresses into ~300 MB while enabling individual address lookups with constant-time proofs (~16 ms per check). No blockchain download, no API rate limits.
 
 ---
 
