@@ -10,6 +10,7 @@ A fast Bitcoin/Ethereum address scanner using **BBF Polynomial RSA Accumulators*
 - **`0_sort_addresses.py`** — Sort and route addresses to chunks
 - **`1_RSA_BBF_accumulator.py`** — Build BBF polynomial accumulator
 - **`2_RSA_BBF_verify.py`** — Filter addresses, print those in accumulator to STDOUT
+- **`3_get_balance.py`** — Optional check balance for address found in the RSA accumulator
 
 ---
 
