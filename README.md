@@ -113,11 +113,14 @@ eth:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 ---
 
 ## Performance (50M Addresses, 16 cores)
+---
+
+## Performance (50M Addresses, 16 cores)
 
 | Metric    | Build        | Verify         |
 | --------- | ------------ | -------------- |
-| Time      | 30–60 min    | 16 ms/address  |
-| Throughput| 15K–25K/sec  | 1K/sec (1 core)|
+| Time      | 30–60 min    | 1.5–2 hours    |
+| Throughput| 15K–25K/sec  | 650/sec (1 core), 9,000/sec (16 cores) |
 | Parallel  | 16 workers   | 16 workers     |
 | Memory    | 8–12 GB      | 15 KB          |
 
@@ -129,15 +132,14 @@ eth:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 | --------------------- | ---------- |
 | Accumulator (root)    | 384 bytes  |
 | Trapdoor `s`          | 32 bytes   |
-| Chunk products (3,364)| ~100 MB    |
-| **Total**             | **~100 MB**|
+| Chunk products (3,364)| ~450 MB    |
+| **Total**             | **~453 MB**|
 
-### Compression Ratios
+### Compression Ratios (prime_bits=40)
 
-| Scenario           | Original   | With BBF   | Ratio |
-| ------------------ | ---------- | ---------- | ----- |
-| Address strings    | 1.75 GB    | ~100 MB    | 18:1  |
-| Full proof list    | 19 GB      | ~100 MB    | 190:1 |
+| Scenario           | Original   | With BBF   | Ratio | collision / False positives |
+| ------------------ | ---------- | ---------- | ----- |----------------------------|
+| Address strings    | 2.8 GB     | ~453 MB    | 6.2:1 | 160 in 50 mil               |
 
 ---
 
