@@ -22,7 +22,7 @@ Other filtering methods are more efficient, but this tool offers unique benefits
 
 ### Build accumulator
 
-Segregate >50 million UTXO addresses into 58² (= 3,364) chunks based on the first two characters after the address prefix, achieving >6× compression. Birthday collision risk is negligible at 50 million addresses. Greater compression can be achieved at the cost of more collisions using `--prime-bits 40`, which yields ~312 collisions when tested with 50 million addresses in the accumulator and 50 million random checks.
+Segregate >50 million UTXO addresses into 58² (= 3,364) chunks based on the first two characters after the address prefix, achieving >6× compression. Birthday collision risk is 1 in 50 million at 50 million addresses and `-prime-bits 40` while being neglectable at `-prime-bits 64`. Greater compression can be achieved at the cost of more collisions using `--prime-bits 40`, which yields 312 collisions (1 in 160k) when tested with 50 million addresses in the accumulator and 50 million random checks.
 
 ```bash
 python3 0_sort_addresses.py -i addresses.txt > sorted_addresses.txt
