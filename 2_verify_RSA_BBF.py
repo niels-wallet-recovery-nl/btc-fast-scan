@@ -1,63 +1,28 @@
 #!/usr/bin/env python3
-"""BBF Accumulator Verifier - pipes addresses through, outputs matches only.
-Compatible with chunked RSA accumulator (base64, prime_bits, patterns).
-
-Example use:
-
-# FROM FILE (stdout = matched addresses only)
-cat test_addresses.txt | python3 2_verify.py -f accumulator.json > matched.txt
-
-# FROM STDIN (pipe)
-grep "bc1q" my_wallet.log | python3 2_verify.py -f accumulator.json
-
-# WITH DEBUG (timing on stderr)
-cat wallet_dump.txt | python3 2_verify.py -f accumulator.json --debug
-
-# SAVE MATCHES AND LOG TIMING
-cat addresses.txt | python3 2_verify.py -f accumulator.json --debug > matches.txt 2> timing.log
-##################################
-
-Example usage
-# Basic filter (fast, divisibility only)
-cat addresses.txt | python3 2_verify.py -f accumulator.json > matches.txt
-
-# With full proofs (slow - multi-second per match!)
-cat addresses.txt | python3 2_verify.py -f accumulator.json --prove > matches.txt
-
-# Debug mode (timing to stderr)
-cat addresses.txt | python3 2_verify.py -f accumulator.json --debug 2> timing.log > matches.txt
-
-"""
+"""BBF Accumulator Verifier - works with unsorted input, multiprocess, MEMORY-EFFICIENT."""
 
 from Crypto.Util.number import bytes_to_long, isPrime
-import json, sys, argparse, hashlib, time, base64, os
+import json, sys, argparse, hashlib, time, base64, os, multiprocessing, gc
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     sys.set_int_max_str_digits(0)
 except AttributeError:
     pass
 
-# ==============================================================================
-# CONSTANTS (matching our accumulator)
-# ==============================================================================
-
 PRIME_BITS_DEFAULT = 112
 BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 DEFAULT_PREFIXES_BTC = ['bc1q', 'bc1p', '1', '3']
 DEFAULT_PREFIXES_ETH = ['0x']
 
-# ==============================================================================
-# HELPER FUNCTIONS (matching our accumulator)
-# ==============================================================================
+_CTX = None
 
 def get_alphabet(encoding):
-    """Return alphabet based on encoding type."""
     if encoding.lower() == 'hex':
         return '0123456789abcdefABCDEF'
     return BASE58_ALPHABET
 
 def addr_to_prime(addr: str, bits: int = PRIME_BITS_DEFAULT) -> int:
-    """Address -> prime via SHA256, masked to fixed bit width (matches build)."""
     h = hashlib.sha256(addr.encode()).digest()
     candidate = (1 << (bits - 1)) | (bytes_to_long(h) & ((1 << (bits - 1)) - 1))
     candidate |= 1
@@ -66,55 +31,44 @@ def addr_to_prime(addr: str, bits: int = PRIME_BITS_DEFAULT) -> int:
     return candidate
 
 def b64d(s: str) -> int:
-    """Base64 decode big-int (matches our b64e)."""
     return int.from_bytes(base64.b64decode(s), 'big')
 
 def get_chunk_pattern(addr, prefixes, depth, alphabet):
-    """Extract chunk pattern (matches our build process)."""
     matched_prefix = None
     for prefix in prefixes:
         if addr.startswith(prefix):
             matched_prefix = prefix
             break
-    
     if not matched_prefix:
         return None, None, None
-    
+
     start_idx = len(matched_prefix)
-    chars_needed = depth
-    
-    if len(addr) < start_idx + chars_needed:
-        chars = addr[start_idx:].ljust(chars_needed, alphabet[0])
+    if len(addr) < start_idx + depth:
+        chars = addr[start_idx:].ljust(depth, alphabet[0])
     else:
-        chars = addr[start_idx:start_idx + chars_needed]
-    
+        chars = addr[start_idx:start_idx + depth]
+
     for i, c in enumerate(chars):
         if c not in alphabet:
-            chars = chars[:i] + alphabet[0] * (chars_needed - i)
+            chars = chars[:i] + alphabet[0] * (depth - i)
             break
-    
-    pattern = f"{matched_prefix}:{chars}"
-    return matched_prefix, chars, pattern
 
-# ==============================================================================
-# LOADER (lazy cache for chunk products)
-# ==============================================================================
+    return matched_prefix, chars, f"{matched_prefix}:{chars}"
+
 
 class AccumulatorContext:
-    """Lazy-loaded accumulator with cached chunk products."""
-    
+    """Read-only after init. Safe to share across forked processes."""
+
     def __init__(self, path: str):
         with open(path) as f:
             self.data = json.load(f)
-        
+
         chunk_path = path.replace('.json', '_chunks.json')
         if not os.path.exists(chunk_path):
             raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
-        
         with open(chunk_path) as f:
             self.chunks = json.load(f)
-        
-        # Parse once
+
         self.n = int(self.data['rsa_params']['modulus_n'], 16)
         self.g = int(self.data['rsa_params']['generator_g'])
         self.s = int(self.data['trapdoor_s'], 16)
@@ -123,15 +77,11 @@ class AccumulatorContext:
         self.prefixes = self.data.get('prefixes', DEFAULT_PREFIXES_BTC)
         self.prime_bits = self.data.get('prime_bits', PRIME_BITS_DEFAULT)
         self.alphabet = get_alphabet(self.encoding)
-        
-        # Chunk index for O(1) pattern lookup
+
         self.chunk_map = {c['pattern']: c for c in self.chunks}
-        
-        # Lazy-decoded products (cache per pattern)
         self.product_cache = {}
-    
-    def get_chunk_product(self, pattern: str) -> int:
-        """Lazy-decode chunk product, cache for reuse."""
+
+    def get_chunk_product(self, pattern: str):
         if pattern not in self.product_cache:
             chunk = self.chunk_map.get(pattern)
             if not chunk:
@@ -139,122 +89,126 @@ class AccumulatorContext:
             self.product_cache[pattern] = b64d(chunk['chunk_product'])
         return self.product_cache[pattern]
 
-# ==============================================================================
-# VERIFICATION (divisibility oracle, optional proof)
-# ==============================================================================
 
-def verify_one(ctx: AccumulatorContext, address: str, prove=False) -> tuple:
-    """
-    Verify single address.
-    
-    Returns: (found: bool, time_us: float, reason: str)
-    
-    Fast path: divisibility check (s+x) | P
-    Slow path: full witness verification (optional)
-    """
-    t0 = time.perf_counter()
-    
-    # Get pattern
-    prefix, chars, pattern = get_chunk_pattern(address, ctx.prefixes, ctx.depth, ctx.alphabet)
-    if not pattern:
-        return False, (time.perf_counter() - t0) * 1_000_000, "no prefix match"
-    
-    # Get chunk
-    chunk = ctx.chunk_map.get(pattern)
-    if not chunk:
-        return False, (time.perf_counter() - t0) * 1_000_000, "no chunk"
-    
-    # Derive prime
-    x = addr_to_prime(address, bits=ctx.prime_bits)
-    term = ctx.s + x
-    
-    # Get chunk product (cached)
-    P = ctx.get_chunk_product(pattern)
-    if P is None:
-        return False, (time.perf_counter() - t0) * 1_000_000, "missing product"
-    
-    # Fast path: divisibility oracle
-    if P % term != 0:
-        return False, (time.perf_counter() - t0) * 1_000_000, "not divisible"
-    
-    # If prove=True, verify witness (slow)
-    if prove:
-        A = b64d(chunk['chunk_accumulator'])
-        excluded = P // term
-        proof = pow(ctx.g, excluded, ctx.n)
-        if pow(proof, term, ctx.n) != A:
-            return False, (time.perf_counter() - t0) * 1_000_000, "proof mismatch"
-    
-    return True, (time.perf_counter() - t0) * 1_000_000, "found"
+def _init_worker(ctx):
+    global _CTX
+    _CTX = ctx
 
-# ==============================================================================
-# BATCH PROCESSING (stdin -> stdout, matches only)
-# ==============================================================================
+
+def verify_batch(addresses):
+    """Verify a list of addresses. Returns ONLY the matches."""
+    ctx = _CTX
+    hits = []
+
+    for addr in addresses:
+        _, _, pattern = get_chunk_pattern(addr, ctx.prefixes, ctx.depth, ctx.alphabet)
+        if not pattern:
+            continue
+
+        P = ctx.get_chunk_product(pattern)
+        if P is None:
+            continue
+
+        x = addr_to_prime(addr, bits=ctx.prime_bits)
+        if P % (ctx.s + x) == 0:
+            hits.append(addr)
+
+    return hits
+
 
 def main():
-    parser = argparse.ArgumentParser(description='BBF Accumulator Verifier (chunked, base64)')
-    parser.add_argument('-f', '--file', required=True, help='Accumulator JSON file')
-    parser.add_argument('--debug', action='store_true', help='Verbose output to stderr')
-    parser.add_argument('--prove', action='store_true', help='Full witness verification (slow)')
-    parser.add_argument('--show-nonmembers', action='store_true', help='Print non-members (commented)')
-    args = parser.parse_args()
-    
-    # Load context (cached)
+    ap = argparse.ArgumentParser(description='BBF Accumulator Verifier (MEMORY-EFFICIENT)')
+    ap.add_argument('-f', '--file', required=True, help='Accumulator JSON file')
+    ap.add_argument('-w', '--workers', type=int, default=os.cpu_count(),
+                    help='Worker processes (default: CPU count)')
+    ap.add_argument('--batch-size', type=int, default=2000, help='Addresses per task')
+    ap.add_argument('--max-inflight', type=int, default=None,
+                    help='Max outstanding tasks before waiting (default: 2×workers)')
+    ap.add_argument('--debug', action='store_true', help='Timing/progress to stderr')
+    args = ap.parse_args()
+
+    t_load = time.perf_counter()
     try:
         ctx = AccumulatorContext(args.file)
-        if args.debug:
-            print(f"[DEBUG] Loaded {len(ctx.chunks)} chunks, {ctx.data.get('address_count', '?'):,} addresses",
-                  file=sys.stderr, flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to load accumulator: {e}", file=sys.stderr)
         sys.exit(1)
-    
-    total_start = time.perf_counter()
-    matches, total = 0, 0
-    seen = set()  # Dedup
-    
-    for line_num, line in enumerate(sys.stdin, 1):
-        addr = line.strip().split()[0] if line.strip() else None
-        if not addr or len(addr) < 20:
-            continue
-        
-        # Dedup
-        if addr in seen:
-            if args.debug:
-                print(f"[DEBUG] Line {line_num}: DUPLICATE", file=sys.stderr, flush=True)
-            continue
-        seen.add(addr)
-        
-        total += 1
-        found, elapsed_us, reason = verify_one(ctx, addr, prove=args.prove)
-        
-        if found:
-            matches += 1
-            print(addr, flush=True)  # Matched addresses -> stdout
-            if args.debug:
-                print(f"[DEBUG] Line {line_num}: {addr[:20]}... FOUND ({elapsed_us:.1f}µs)",
-                      file=sys.stderr, flush=True)
-        else:
-            if args.show_nonmembers:
-                print(f"# NONMEMBER {addr} ({reason})", file=sys.stderr, flush=True)
-            if args.debug:
-                print(f"[DEBUG] Line {line_num}: {addr[:20]}... NOT FOUND ({elapsed_us:.1f}µs, {reason})",
-                      file=sys.stderr, flush=True)
-        
-        # Progress every 10K
-        if total % 10000 == 0 and args.debug:
-            elapsed = time.perf_counter() - total_start
-            print(f"[DEBUG] Progress: {total:,}/{matches:,} ({elapsed:.1f}s)",
-                  file=sys.stderr, flush=True)
-    
-    total_elapsed = time.perf_counter() - total_start
+
     if args.debug:
-        avg_us = (total_elapsed * 1_000_000) / max(total, 1)
-        print(f"[DEBUG] Processed {total:,} addresses | {matches:,} matches",
+        print(f"[DEBUG] Loaded {len(ctx.chunks):,} chunks "
+              f"({ctx.data.get('address_count', '?')} addresses) in "
+              f"{time.perf_counter() - t_load:.1f}s", file=sys.stderr, flush=True)
+
+    mp_ctx = multiprocessing.get_context('fork') if hasattr(os, 'fork') \
+        else multiprocessing.get_context()
+
+    total_start = time.perf_counter()
+    total = matches = 0
+    batch = []
+    
+    # Bounded inflight to prevent memory explosion
+    max_inflight = args.max_inflight or (args.workers * 2)
+
+    with ProcessPoolExecutor(max_workers=args.workers, mp_context=mp_ctx,
+                             initializer=_init_worker, initargs=(ctx,)) as ex:
+
+        active_futures = []
+
+        for line in sys.stdin:
+            addr = line.strip().split()[0] if line.strip() else None
+            if not addr or len(addr) < 20:
+                continue
+
+            total += 1
+            batch.append(addr)
+
+            if len(batch) >= args.batch_size:
+                # Submit batch
+                fut = ex.submit(verify_batch, batch)
+                active_futures.append(fut)
+                
+                # IMMEDIATELY discard batch - it's now owned by the future
+                batch = []
+
+                # BACKPRESSURE: Wait if too many inflight
+                while len(active_futures) >= max_inflight:
+                    # Wait for ONE to complete and consume it immediately
+                    done = next(as_completed(active_futures))
+                    active_futures.remove(done)
+                    
+                    for matched_addr in done.result():
+                        print(matched_addr, flush=True)
+                        matches += 1
+                    
+                    del done
+                    gc.collect() if total % 100000 == 0 else None
+
+                if args.debug and total % 100000 == 0:
+                    el = time.perf_counter() - total_start
+                    print(f"[DEBUG] read {total:,} | inflight {len(active_futures)} ({el:.1f}s)",
+                          file=sys.stderr, flush=True)
+
+        # Final batch
+        if batch:
+            fut = ex.submit(verify_batch, batch)
+            active_futures.append(fut)
+            batch = []
+
+        # Drain remaining futures with immediate consumption
+        for fut in as_completed(active_futures):
+            for matched_addr in fut.result():
+                print(matched_addr, flush=True)
+                matches += 1
+            del fut  # Release reference
+
+        active_futures.clear()
+
+    el = time.perf_counter() - total_start
+    if args.debug:
+        print(f"[DEBUG] {total:,} addresses | {matches:,} matches | {el:.1f}s "
+              f"| {total/max(el,1):,.0f} addr/sec | {args.workers} workers",
               file=sys.stderr, flush=True)
-        print(f"[DEBUG] Total: {total_elapsed:.1f}s ({total_elapsed/max(total,1)*1000:.2f}ms/addr avg)",
-              file=sys.stderr, flush=True)
-        print(f"[DEBUG] Throughput: {total/max(total_elapsed,1):,.0f} addr/sec",
+        print(f"[DEBUG] Peak inflight: ~{max_inflight} tasks (~{max_inflight*args.batch_size} addresses)",
               file=sys.stderr, flush=True)
 
 if __name__ == '__main__':
